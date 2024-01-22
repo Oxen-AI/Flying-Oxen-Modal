@@ -3,6 +3,7 @@ from pathlib import Path
 import random
 import uuid
 from fastapi import FastAPI, Request
+from oxen import RemoteRepo
 
 from modal import Image, Mount, Stub, asgi_app, build, enter, gpu, method
 
@@ -17,6 +18,7 @@ sdxl_image = (
         "transformers~=4.31",
         "accelerate~=0.21",
         "safetensors~=0.3",
+        "oxenai",
     )
 )
 
@@ -30,7 +32,11 @@ with sdxl_image.imports():
     from fastapi.responses import Response
     from huggingface_hub import snapshot_download
 
+@stub.function(image=sdxl_image)
 def generate_random_prompt(username):
+    '''
+    generate the 
+    '''
     adjectives = ["grand", "noble", "splendid", "majestic", "regal", "royal",
                      "stately", "august", "magnificent", "dignified", "imposing",
                      "sublime", "resplendent", "glorious", "impressive", "exalted",
@@ -61,8 +67,12 @@ def generate_random_prompt(username):
     print(prompt)
     return prompt
 
-
+@stub.function(image=sdxl_image)
 def save_to_oxen(repo_name, branch_name, prompt, file_names, commit_message):
+    '''
+    save the file to oxen repo
+    '''
+
     repo = RemoteRepo(repo_name)
     repo.checkout(branch_name)
 
@@ -148,7 +158,7 @@ async def generate_image(
     print(f"POST /imagine - received data={data}")
 
     if data['action'] == 'created': 
-        data['prompt'] = generate_random_prompt(data['sender']['login'])
+        data['prompt'] = generate_random_prompt.remote(data['sender']['login'])
     
     if data['prompt']:
         prompt = data['prompt']
@@ -157,9 +167,9 @@ async def generate_image(
         
         commit_message = f"{prompt}"
         namespace = "ox"
-        repo_name = "GenerativeImagePlayground"
+        repo_name = "FlyingOxen"
         branch_name = "main"
-        commit, images = save_to_oxen(f"{namespace}/{repo_name}", branch_name, prompt, file_names, commit_message)
+        commit, images = save_to_oxen.remote(f"{namespace}/{repo_name}", branch_name, prompt, file_names, commit_message)
         commit_id = commit.commit_id
         return {
             "status": "success",
@@ -173,6 +183,7 @@ async def generate_image(
         }
     else:
         return {"status": "error", "status_message": "Must supply 'prompt' field in json"}
+
 
 
 @app.post("/echo")
