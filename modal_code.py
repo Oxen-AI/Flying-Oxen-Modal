@@ -1,11 +1,13 @@
-import io
+import os, io
 from pathlib import Path
 import random
 import uuid
 from fastapi import FastAPI, Request
 from oxen import RemoteRepo
+import oxen
+import modal
 
-from modal import Image, Mount, Stub, asgi_app, build, enter, gpu, method
+from modal import Image, Secret, Stub, asgi_app, build, enter, gpu, method
 
 sdxl_image = (
     Image.debian_slim()
@@ -67,7 +69,7 @@ def generate_random_prompt(username):
     print(prompt)
     return prompt
 
-@stub.function(image=sdxl_image)
+@stub.function(image=sdxl_image, secret=modal.Secret.from_name("oxenai-api-key"))
 def save_to_oxen(repo_name, branch_name, prompt, file_names, commit_message):
     '''
     save the file to oxen repo
@@ -75,6 +77,10 @@ def save_to_oxen(repo_name, branch_name, prompt, file_names, commit_message):
 
     repo = RemoteRepo(repo_name)
     repo.checkout(branch_name)
+    
+    api_key = os.environ["OXENAI_API_KEY"]
+    oxen.auth.config_auth(api_key)
+    oxen.user.config_user("Bessie", "ox@oxen.ai")
 
     # Add all files in one commmit
     paths = []
@@ -138,14 +144,16 @@ class Model:
             num_inference_steps=num_steps
         ).images   # type: ignore
         print(images)
-        file_names = []
+        image_byte_list = []
 
+        os.makedirs("images", exist_ok=True)
         for image in images:
-            file_name = "-".join(file_base_name) + "-" + str(uuid.uuid4()) + ".png"
-            image.save(file_name)
-            file_names.append(file_name)
-        # print(file_names)
-        return file_names   
+            byte_stream = io.BytesIO()
+            image.save(byte_stream, format="PNG")
+            image_bytes = byte_stream.getvalue()
+            image_byte_list.append(image_bytes)
+
+        return image_byte_list
 
 
 app = FastAPI()
@@ -157,19 +165,55 @@ async def generate_image(
     data = await request.json()
     print(f"POST /imagine - received data={data}")
 
-    if data['action'] == 'created': 
+    if 'action' in data and data['action'] == 'created': 
         data['prompt'] = generate_random_prompt.remote(data['sender']['login'])
     
     if data['prompt']:
         prompt = data['prompt']
-        file_names = Model().imagine.remote(prompt)
+        image_byte_list = Model().imagine.remote(prompt)
         print("Saving to Oxen")
         
         commit_message = f"{prompt}"
         namespace = "ox"
         repo_name = "FlyingOxen"
         branch_name = "main"
-        commit, images = save_to_oxen.remote(f"{namespace}/{repo_name}", branch_name, prompt, file_names, commit_message)
+
+        repo = RemoteRepo(f"{namespace}/{repo_name}")
+        repo.checkout(branch_name)
+        
+        api_key = os.environ["OXENAI_API_KEY"]
+        oxen.auth.config_auth(api_key)
+        oxen.user.config_user("Bessie", "ox@oxen.ai")
+
+        # Add all files in one commmit
+        paths = []
+        os.makedirs("images", exist_ok=True)
+        for image_bytes in image_byte_list:
+            file_base_name = str(prompt).split(" ")[:10]
+            basename = "-".join(file_base_name) + "-" + str(uuid.uuid4()) + ".png"
+            file_name = os.path.join("images", basename)
+            
+            print(f"Saving it to {file_name}")
+            with open(file_name, "wb") as f:
+                f.write(image_bytes)
+            
+            repo.add(file_name, "images")
+            repo_path = f"images/{file_name}"
+            paths.append(repo_path)
+            repo.add_df_row("annotations.jsonl", {"prompt": prompt, "image": repo_path, "model": "stable-diffusion-xl-base-1.0"})
+
+        commit = repo.commit(commit_message)
+        images = []
+        for path in paths:
+            images.append({
+                "path": path,
+                "content_url": f"https://hub.oxen.ai/api/repos/{namespace}/{repo_name}/file/{commit.commit_id}/{path}",
+                # https://www.oxen.ai/ox/GenerativeImagePlayground/file/edfdd2bc11396d86/images/a-white-fluffy-ox-427b3fa6-fed2-4379-b9a8-04babf476bc8.png
+                "view_url": f"https://oxen.ai/{namespace}/{repo_name}/file/{commit.commit_id}/{path}",
+            })
+        print(f"Got Commit: {commit}")
+        os.remove(file_name)
+
         commit_id = commit.commit_id
         return {
             "status": "success",
@@ -184,14 +228,12 @@ async def generate_image(
     else:
         return {"status": "error", "status_message": "Must supply 'prompt' field in json"}
 
-
-
 @app.post("/echo")
 async def foo(request: Request):
     data = await request.json()
     return data
 
-@stub.function(image=sdxl_image)
+@stub.function(image=sdxl_image, secret=modal.Secret.from_name("oxenai-api-key"))
 @asgi_app()
 def fastapi_app():
     return app
